@@ -20,8 +20,10 @@ BATCH_SIZE = 64
 ITERATIONS_BEFORE_TRAINING = BATCH_SIZE + 1
 REPLAY_BUFFER_SIZE = 10000
 
-state_dim = env.observation_space.shape[0]
-action_dim = env.action_space.shape[0]
+STATE_DIM = env.observation_space.shape[0]
+ACTION_DIM = env.action_space.shape[0]
+PER_ACTION_POLICY_DIM = 10
+FLATTENED_POLICY_DIM = PER_ACTION_POLICY_DIM * ACTION_DIM
 
 
 def fanin_init(layer):
@@ -32,8 +34,8 @@ def fanin_init(layer):
 
 class Noise:
     def __init__(self,):
-        global action_dim
-        self.state = np.zeros(action_dim)
+        global FLATTENED_POLICY_DIM
+        self.state = np.zeros(FLATTENED_POLICY_DIM)
 
     def josh(self, mu, sigma):
         return stats.truncnorm.rvs((-1 - mu) / sigma, (1 - mu) / sigma, loc=mu, scale=sigma, size=len(self.state))
@@ -43,13 +45,15 @@ class Noise:
         return self.state
 
 
-def actor_network(state, outer_scope, reuse=False):
-    global action_dim
+def actor_network(state, last_theta_phi, outer_scope, reuse=False):
+    global FLATTENED_POLICY_DIM
     with tf.variable_scope(outer_scope + '/actor', reuse=reuse):
         uniform_random = tf.random_uniform_initializer(minval=-3e-3, maxval=3e-3)
-        net = slim.fully_connected(state, 1024, weights_initializer=fanin_init(state), biases_initializer=fanin_init(state))
+        net = tf.concat(1, [state, last_theta_phi])
+        net = slim.fully_connected(net, 1024, weights_initializer=fanin_init(state), biases_initializer=fanin_init(net))
         net = slim.fully_connected(net, 512, weights_initializer=fanin_init(net), biases_initializer=fanin_init(net))
-        return slim.fully_connected(net, action_dim, weights_initializer=uniform_random, biases_initializer=uniform_random, activation_fn=tf.tanh)
+        net = slim.fully_connected(net, FLATTENED_POLICY_DIM, weights_initializer=uniform_random, biases_initializer=uniform_random, activation_fn=None)
+        return tf.tanh(net + last_theta_phi)
 
 
 def critic_network(state, action, outer_scope, reuse=False):
@@ -63,18 +67,30 @@ def critic_network(state, action, outer_scope, reuse=False):
         return tf.squeeze(net, [1])
 
 
-state_placeholder = tf.placeholder(tf.float32, [None, state_dim], 'state')
-action_placeholder = tf.placeholder(tf.float32, [None, action_dim], 'action_train')
+def phi(theta):
+    return tf.reduce_sum(theta * np.array([np.eye(FLATTENED_POLICY_DIM)[0]]), reduction_indices=1)
+
+
+def phishift(theta):
+    return tf.identity(theta) * 0.0
+
+state_placeholder = tf.placeholder(tf.float32, [None, STATE_DIM], 'state')
+last_theta_phi_placeholder = tf.placeholder(tf.float32, [None, FLATTENED_POLICY_DIM], 'last_theta_phi')
+theta_phi_placeholder = tf.placeholder(tf.float32, [None, FLATTENED_POLICY_DIM], 'theta_phi')
 reward_placeholder = tf.placeholder(tf.float32, [None], 'reward')
-next_state_placeholder = tf.placeholder(tf.float32, [None, state_dim], 'next_state')
+next_state_placeholder = tf.placeholder(tf.float32, [None, STATE_DIM], 'next_state')
 done_placeholder = tf.placeholder(tf.bool, [None], 'done')
 
-train_actor_output = actor_network(state_placeholder, outer_scope='train_network')
-target_actor_next_output = actor_network(next_state_placeholder, outer_scope='target_network')
+train_actor_output = actor_network(state_placeholder, last_theta_phi_placeholder, outer_scope='train_network')
+train_actor_output_phi = phi(train_actor_output)
+phi_theta_phi_placeholder = phi(theta_phi_placeholder)
+phishift_theta_phi_placeholder = phishift(theta_phi_placeholder)
+target_actor_output = actor_network(state_placeholder, last_theta_phi_placeholder, outer_scope='target_network')
+target_actor_next_output = actor_network(next_state_placeholder, last_theta_phi_placeholder, outer_scope='target_network', reuse=True)
 
 target_critic_next_output = critic_network(next_state_placeholder, target_actor_next_output, outer_scope='target_network')
 train_critic_current_action = critic_network(state_placeholder, train_actor_output, outer_scope='train_network')
-train_critic_placeholder_action = critic_network(state_placeholder, action_placeholder, outer_scope='train_network', reuse=True)
+train_critic_placeholder_action = critic_network(state_placeholder, theta_phi_placeholder, outer_scope='train_network', reuse=True)
 
 train_actor_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='train_network/actor')
 target_actor_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='target_network/actor')
@@ -124,25 +140,29 @@ rewards = []
 
 for episode in tqdm(xrange(1000)):
     env_state = env.reset()
+    last_theta_phi = [np.zeros(FLATTENED_POLICY_DIM)]
     eta_noise = Noise()
     training = len(replay_buffer) >= min(ITERATIONS_BEFORE_TRAINING, replay_buffer.maxlen)
     testing = episode % 2 == 0 and training
 
     for step in tqdm(xrange(1000)):
-        action = sess.run(train_actor_output, feed_dict={state_placeholder: [env_state]})[0]
-        action += 0 if testing else eta_noise.ou(theta=.15, sigma=.2)
-        # action = action if testing else eta_noise.josh(action, sigma=10*(EPSILON**(episode+(step/2.0))))
+        theta_phi, action = sess.run([train_actor_output, train_actor_output_phi], feed_dict={state_placeholder: [env_state], last_theta_phi_placeholder: last_theta_phi})
+
+        # Exploration Noise
+        if not testing:
+            action = sess.run(phi_theta_phi_placeholder, feed_dict={theta_phi_placeholder: theta_phi + eta_noise.ou(theta=.15, sigma=.2)})
 
         env_next_state, env_reward, env_done, env_info = env.step(np.clip(action, -1, 1) * 2)
 
         if not testing:
-            replay_buffer.append((env_state, action, env_reward, env_next_state, env_done))
+            replay_buffer.append((env_state, last_theta_phi[0], theta_phi[0], env_reward, env_next_state, env_done))
 
             replay_error_sum -= replay_errors[len(replay_buffer) - 1]
             replay_errors[len(replay_buffer) - 1] = 100.0
             replay_error_sum += 100.0
 
         env_state = env_next_state
+        last_theta_phi = sess.run(phishift_theta_phi_placeholder, feed_dict={theta_phi_placeholder: theta_phi})
 
         if training:
             env.render()
@@ -150,14 +170,16 @@ for episode in tqdm(xrange(1000)):
             minibatch_indexes = np.random.choice(xrange(len(replay_buffer)), size=BATCH_SIZE, replace=False, p=p_errors)
 
             state_batch = [replay_buffer[i][0] for i in minibatch_indexes]
-            action_batch = [replay_buffer[i][1] for i in minibatch_indexes]
-            reward_batch = [replay_buffer[i][2] for i in minibatch_indexes]
-            next_state_batch = [replay_buffer[i][3] for i in minibatch_indexes]
-            done_batch = [replay_buffer[i][4] for i in minibatch_indexes]
+            last_theta_phi_batch = [replay_buffer[i][1] for i in minibatch_indexes]
+            theta_phi_batch = [replay_buffer[i][2] for i in minibatch_indexes]
+            reward_batch = [replay_buffer[i][3] for i in minibatch_indexes]
+            next_state_batch = [replay_buffer[i][4] for i in minibatch_indexes]
+            done_batch = [replay_buffer[i][5] for i in minibatch_indexes]
 
             _, _, errors, lc, la = sess.run([train_actor, train_critic, q_error, loss_critic, loss_actor], feed_dict={
                 state_placeholder: state_batch,
-                action_placeholder: action_batch,
+                last_theta_phi_placeholder: last_theta_phi_batch,
+                theta_phi_placeholder: theta_phi_batch,
                 reward_placeholder: reward_batch,
                 next_state_placeholder: next_state_batch,
                 done_placeholder: done_batch
