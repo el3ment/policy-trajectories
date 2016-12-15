@@ -6,6 +6,7 @@ import tensorflow.contrib.slim as slim
 import random
 import numpy as np
 from scipy import stats
+import matplotlib.pyplot as plt
 
 env = gym.make('Pendulum-v0')
 
@@ -19,10 +20,12 @@ CRITIC_L2_WEIGHT_DECAY = 0.01
 BATCH_SIZE = 64
 ITERATIONS_BEFORE_TRAINING = BATCH_SIZE + 1
 REPLAY_BUFFER_SIZE = 10000
+LAMBDA_RESIDUAL = 0.001
 
 STATE_DIM = env.observation_space.shape[0]
-FLATTENED_THETA_PHI_DIM = 10
 ACTION_DIM = env.action_space.shape[0]
+THETA_PHI_PER_ACTION_DIM = 10
+FLATTENED_THETA_PHI_DIM = THETA_PHI_PER_ACTION_DIM * ACTION_DIM
 
 
 def fanin_init(layer):
@@ -52,7 +55,7 @@ def actor_network(state, last_theta_phi, outer_scope, reuse=False):
         net = slim.fully_connected(net, 1024, weights_initializer=fanin_init(state), biases_initializer=fanin_init(net))
         net = slim.fully_connected(net, 512, weights_initializer=fanin_init(net), biases_initializer=fanin_init(net))
         net = slim.fully_connected(net, FLATTENED_THETA_PHI_DIM, weights_initializer=uniform_random, biases_initializer=uniform_random, activation_fn=None)
-        return tf.tanh(net + last_theta_phi)
+        return tf.tanh(net + last_theta_phi), net
 
 
 def critic_network(state, action, outer_scope, reuse=False):
@@ -71,7 +74,7 @@ def phi(theta):
 
 
 def phishift(theta):
-    return tf.identity(theta)
+    return tf.pad(tf.slice(theta, [0, 1], [-1, -1]), [[0, 0], [0, 1]])
 
 
 state_placeholder = tf.placeholder(tf.float32, [None, STATE_DIM], 'state')
@@ -81,8 +84,8 @@ reward_placeholder = tf.placeholder(tf.float32, [None], 'reward')
 next_state_placeholder = tf.placeholder(tf.float32, [None, STATE_DIM], 'next_state')
 done_placeholder = tf.placeholder(tf.bool, [None], 'done')
 
-train_actor_output = actor_network(state_placeholder, last_theta_phi_placeholder, outer_scope='train_network')
-target_actor_next_output = actor_network(next_state_placeholder, last_theta_phi_placeholder, outer_scope='target_network')
+train_actor_output, train_actor_output_residual = actor_network(state_placeholder, last_theta_phi_placeholder, outer_scope='train_network')
+target_actor_next_output, target_actor_next_output_residual = actor_network(next_state_placeholder, last_theta_phi_placeholder, outer_scope='target_network')
 
 phi_from_theta_phi_placeholder = phi(theta_phi_placeholder)
 phishift_from_theta_phi_placeholder = phishift(theta_phi_placeholder)
@@ -98,7 +101,8 @@ target_critic_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='
 
 with tf.name_scope('actor_loss'):
     weight_decay_actor = tf.add_n([ACTOR_L2_WEIGHT_DECAY * tf.nn.l2_loss(var) for var in train_actor_vars])
-    loss_actor = -tf.reduce_mean(train_critic_current_action) + weight_decay_actor
+    weight_regularizer = tf.add_n([ACTOR_L2_WEIGHT_DECAY * tf.nn.l2_loss(var) for var in train_actor_vars])
+    loss_actor = -tf.reduce_mean(train_critic_current_action) + weight_decay_actor + LAMBDA_RESIDUAL * tf.abs(train_actor_output_residual)
 
     # Actor Optimization
     optim_actor = tf.train.AdamOptimizer(ACTOR_LR)
@@ -144,11 +148,14 @@ for episode in tqdm(xrange(1000)):
     training = len(replay_buffer) >= min(ITERATIONS_BEFORE_TRAINING, replay_buffer.maxlen)
     testing = episode % 2 == 0 and training
 
+    history = []
+
     for step in tqdm(xrange(1000)):
         theta_phi = sess.run(train_actor_output, feed_dict={state_placeholder: [env_state], last_theta_phi_placeholder: [last_theta_phi]})[0]
         if not testing:
             theta_phi += 0 if testing else eta_noise.ou(theta=.15, sigma=.2)
 
+        history.append(theta_phi)
         action = sess.run(phi_from_theta_phi_placeholder, feed_dict={theta_phi_placeholder: [theta_phi]})
 
         assert action.shape == env.action_space.sample().shape, (action.shape, env.action_space.sample().shape)
@@ -192,3 +199,13 @@ for episode in tqdm(xrange(1000)):
 
         if env_done:
             break
+
+    if testing:
+        h = np.array(history)
+        a = h.T
+        a = a - a.min()
+        a /= a.max()
+        b = np.hstack([np.zeros([a.shape[0], 1]), np.diff(a, n=1, axis=1)])
+        plt.imshow(np.vstack([a, np.abs(b)]), interpolation='nearest', aspect='auto')
+        plt.colorbar()
+        plt.show()
