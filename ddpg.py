@@ -10,6 +10,10 @@ import matplotlib.pyplot as plt
 
 env = gym.make('Pendulum-v0')
 
+LAMBDA_RESIDUAL = 1
+FUTURE_THETA_N = 1
+TIME_DIM = 10
+
 TAU = 0.001
 GAMMA = .99
 EPSILON = .99
@@ -18,11 +22,8 @@ CRITIC_LR = 0.0001
 ACTOR_L2_WEIGHT_DECAY = 0.01
 CRITIC_L2_WEIGHT_DECAY = 0.01
 BATCH_SIZE = 64
-ITERATIONS_BEFORE_TRAINING = BATCH_SIZE + 1
+ITERATIONS_BEFORE_TRAINING = BATCH_SIZE + 1 + TIME_DIM
 REPLAY_BUFFER_SIZE = 10000
-
-LAMBDA_RESIDUAL = 1
-FUTURE_THETA_N = 1
 
 RBF_NUM_KERNELS = 1
 RBF_NUM_PARAMETERS = 1
@@ -54,18 +55,34 @@ class Noise:
         return self.state
 
 
-def actor_network(state, last_theta_phi, outer_scope, reuse=False):
-    global FLATTENED_THETA_PHI_DIM
-    with tf.variable_scope(outer_scope + '/actor', reuse=reuse):
-        uniform_random = tf.random_uniform_initializer(minval=-3e-3, maxval=3e-3)
-        net = tf.concat(1, [state, last_theta_phi])
-        net = slim.fully_connected(net, 1024, weights_initializer=fanin_init(state),
-                                   biases_initializer=fanin_init(net))
-        net = slim.fully_connected(net, 512, weights_initializer=fanin_init(net),
-                                   biases_initializer=fanin_init(net))
-        net = slim.fully_connected(net, FLATTENED_THETA_PHI_DIM, weights_initializer=uniform_random,
-                                   biases_initializer=uniform_random, activation_fn=None)
-        return tf.clip_by_value(tf.tanh(net) + last_theta_phi, -1, 1), net
+class ActorCell(tf.nn.rnn_cell.RNNCell):
+    def __init__(self, outer_scope, reuse=False):
+        self.outer_scope = outer_scope
+        self.reuse = reuse
+        self._state_is_tuple = True
+
+    @property
+    def state_size(self):
+        return (FLATTENED_THETA_PHI_DIM, FLATTENED_THETA_PHI_DIM)
+
+    @property
+    def output_size(self):
+        return FLATTENED_THETA_PHI_DIM
+
+    def __call__(self, inputs, state, scope=None):
+        last_theta_phi = state[0]
+        with tf.variable_scope(self.outer_scope + '/actor', reuse=self.reuse):
+            uniform_random = tf.random_uniform_initializer(minval=-3e-3, maxval=3e-3)
+            net = tf.concat(1, [inputs, last_theta_phi])
+            net = slim.fully_connected(net, 1024, weights_initializer=fanin_init(inputs),
+                                       biases_initializer=fanin_init(net))
+            net = slim.fully_connected(net, 512, weights_initializer=fanin_init(net),
+                                       biases_initializer=fanin_init(net))
+            residual = slim.fully_connected(net, FLATTENED_THETA_PHI_DIM, weights_initializer=uniform_random,
+                                            biases_initializer=uniform_random, activation_fn=tf.tanh)
+            output = tf.clip_by_value(residual + last_theta_phi, -1, 1)
+
+        return output, (output, residual)
 
 
 def critic_network(state, theta_phi, last_theta_phi, outer_scope, reuse=False):
@@ -101,9 +118,9 @@ def phi(theta, t=0):
 def phishift(theta):
     return tf.identity(theta)
 
-tf.nn.rnn_cell
 
 state_placeholder = tf.placeholder(tf.float32, [None, STATE_DIM], 'state')
+temporally_extended_states_placeholder = tf.placeholder(tf.float32, [None, TIME_DIM, STATE_DIM], 'temporally_extended_states')
 theta_phi_placeholder = tf.placeholder(tf.float32, [None, FLATTENED_THETA_PHI_DIM], 'theta_phi')
 last_theta_phi_placeholder = tf.placeholder(tf.float32, [None, FLATTENED_THETA_PHI_DIM], 'last_theta_phi')
 future_theta_phi_placeholder = tf.placeholder(tf.float32, [None, FLATTENED_THETA_PHI_DIM], 'future_theta_phi')
@@ -111,30 +128,33 @@ reward_placeholder = tf.placeholder(tf.float32, [None], 'reward')
 next_state_placeholder = tf.placeholder(tf.float32, [None, STATE_DIM], 'next_state')
 done_placeholder = tf.placeholder(tf.bool, [None], 'done')
 
-train_actor_output, train_actor_output_residual = actor_network(state_placeholder, last_theta_phi_placeholder, outer_scope='train_network')
-train_actor_next_output, train_actor_next_output_residual = actor_network(next_state_placeholder, train_actor_output, outer_scope='train_network', reuse=True)
+train_actor_output, (_, train_actor_output_residual) = ActorCell(outer_scope='ddpg/train_network')(state_placeholder, state=(last_theta_phi_placeholder, None))
+train_actor_next_output, (_, train_actor_next_output_residual) = ActorCell(outer_scope='ddpg/train_network', reuse=True)(next_state_placeholder, state=(train_actor_output, None))
+target_actor_output, target_actor_output_residual = ActorCell(outer_scope='ddpg/target_network')(state_placeholder, state=(last_theta_phi_placeholder, None))
+target_actor_next_output, target_actor_next_output_residual = ActorCell(outer_scope='ddpg/target_network', reuse=True)(next_state_placeholder, state=(tf.stop_gradient(target_actor_output), None))
 
-target_actor_output, target_actor_output_residual = actor_network(state_placeholder, last_theta_phi_placeholder, outer_scope='target_network')
-target_actor_next_output, target_actor_next_output_residual = actor_network(next_state_placeholder, tf.stop_gradient(target_actor_output), outer_scope='target_network', reuse=True)
+train_actor_cell = ActorCell(outer_scope='train_network', reuse=True)
+extended_train_actor_outputs, (_, extended_train_actor_residuals) = tf.nn.dynamic_rnn(scope="ddpg", cell=train_actor_cell, inputs=temporally_extended_states_placeholder, initial_state=(last_theta_phi_placeholder, tf.zeros_like(last_theta_phi_placeholder)))
 
 phi_from_theta_phi_placeholder = phi(theta_phi_placeholder)
 phishift_from_theta_phi_placeholder = phishift(theta_phi_placeholder)
 
-target_critic_next_output = critic_network(next_state_placeholder, target_actor_next_output, target_actor_output, outer_scope='target_network')
-train_critic_current_action = critic_network(state_placeholder, train_actor_output, last_theta_phi_placeholder, outer_scope='train_network')
-train_critic_placeholder_action = critic_network(state_placeholder, theta_phi_placeholder, last_theta_phi_placeholder, outer_scope='train_network', reuse=True)
+target_critic_next_output = critic_network(next_state_placeholder, target_actor_next_output, target_actor_output, outer_scope='ddpg/target_network')
+train_critic_current_action = critic_network(state_placeholder, train_actor_output, last_theta_phi_placeholder, outer_scope='ddpg/train_network')
+train_critic_placeholder_action = critic_network(state_placeholder, theta_phi_placeholder, last_theta_phi_placeholder, outer_scope='ddpg/train_network', reuse=True)
 
-train_actor_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='train_network/actor')
-target_actor_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='target_network/actor')
-train_critic_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='train_network/critic')
-target_critic_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='target_network/critic')
+train_actor_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='ddpg/train_network/actor')
+target_actor_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='ddpg/target_network/actor')
+train_critic_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='ddpg/train_network/critic')
+target_critic_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='ddpg/target_network/critic')
 
 with tf.name_scope('actor_loss'):
     weight_decay_actor = tf.add_n([ACTOR_L2_WEIGHT_DECAY * tf.nn.l2_loss(var) for var in train_actor_vars])
-    weight_regularizer = tf.add_n([ACTOR_L2_WEIGHT_DECAY * tf.nn.l2_loss(var) for var in train_actor_vars])
 
     optim_actor = tf.train.AdamOptimizer(ACTOR_LR)
-    loss_actor = -tf.reduce_mean(train_critic_current_action) + weight_decay_actor
+    loss_sparsity = tf.nn.l2_loss(extended_train_actor_residuals)
+    loss_actor = -tf.reduce_mean(train_critic_current_action) + weight_decay_actor + loss_sparsity
+
 
     # Actor Optimization
     grads_and_vars_actor = optim_actor.compute_gradients(loss_actor, var_list=train_actor_vars)
@@ -145,7 +165,7 @@ with tf.name_scope('actor_loss'):
         train_actor = tf.group(*[target.assign(TAU * train + (1 - TAU) * target) for train, target in train_target_vars])
 
 with tf.name_scope('critic_loss'):
-    q_target_value = tf.stop_gradient(
+    q_target_value = tf.sftop_gradient(
         tf.select(done_placeholder, reward_placeholder, reward_placeholder + GAMMA * target_critic_next_output))
     q_error = (q_target_value - train_critic_placeholder_action) ** 2
     q_error_batch = tf.reduce_mean(q_error)
@@ -210,9 +230,8 @@ for episode in tqdm(xrange(1000)):
 
 
         if training:
-
-            p_errors = replay_priorities[:len(replay_buffer)] / replay_priorities_sum
-            minibatch_indexes = np.random.choice(xrange(len(replay_buffer)), size=BATCH_SIZE, replace=False, p=p_errors)
+            p_errors = replay_priorities[:len(replay_buffer) - TIME_DIM] / (replay_priorities_sum - replay_priorities[len(replay_buffer) - TIME_DIM:len(replay_buffer)].sum())
+            minibatch_indexes = np.random.choice(xrange(len(replay_buffer) - TIME_DIM), size=BATCH_SIZE, replace=False, p=p_errors)
 
             state_batch = [replay_buffer[i][0] for i in minibatch_indexes]
             theta_phi_batch = [replay_buffer[i][1] for i in minibatch_indexes]
@@ -220,6 +239,8 @@ for episode in tqdm(xrange(1000)):
             next_state_batch = [replay_buffer[i][3] for i in minibatch_indexes]
             done_batch = [replay_buffer[i][4] for i in minibatch_indexes]
             last_theta_phi_batch = [replay_buffer[i][5] for i in minibatch_indexes]
+
+            temporally_extended_states_batch = [[replay_buffer[i + t][0] for t in range(TIME_DIM)] for i in minibatch_indexes]
 
             future_theta_phi = [replay_buffer[i + FUTURE_THETA_N][1] if len(replay_buffer) > i + FUTURE_THETA_N else replay_buffer[i][1] for i in minibatch_indexes]
 
@@ -231,7 +252,8 @@ for episode in tqdm(xrange(1000)):
                                                 reward_placeholder: reward_batch,
                                                 next_state_placeholder: next_state_batch,
                                                 future_theta_phi_placeholder: future_theta_phi,
-                                                done_placeholder: done_batch
+                                                done_placeholder: done_batch,
+                                                temporally_extended_states_placeholder: temporally_extended_states_batch
                                             })
 
 
