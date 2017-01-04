@@ -26,7 +26,7 @@ BATCH_SIZE = 64
 ITERATIONS_BEFORE_TRAINING = BATCH_SIZE + 1 + TIME_DIM
 REPLAY_BUFFER_SIZE = 10000
 MAX_EPISODE_LENGTH = 1000
-BETA = 0
+BETA = .001
 
 RBF_NUM_KERNELS = 1
 RBF_NUM_PARAMETERS = 1
@@ -186,7 +186,7 @@ with tf.name_scope('actor_loss'):
         train_actor = tf.group(*[target.assign(TAU * train + (1 - TAU) * target) for train, target in train_target_vars])
 
 with tf.name_scope('critic_loss'):
-    combined_reward = reward_placeholder + BETA * reward_bonus_placeholder
+    combined_reward = reward_placeholder + BETA * tf.reduce_sum(tf.abs(train_actor_output_residual))
     q_target_value = tf.stop_gradient(tf.select(done_placeholder, combined_reward, combined_reward + GAMMA * target_critic_next_output))
     q_error = (q_target_value - train_critic_placeholder_action) ** 2
     q_error_batch = tf.reduce_mean(q_error)
