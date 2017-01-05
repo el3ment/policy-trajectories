@@ -11,22 +11,20 @@ import numpy as np
 from scipy import stats
 import matplotlib.pyplot as plt
 
-LAMBDA_RESIDUAL = 1
 FUTURE_THETA_N = 1
-TIME_DIM = 10
+TIME_DIM = 1
 
-TAU = 0.001
+TAU = 0.01
 GAMMA = .99
-EPSILON = .99
 ACTOR_LR = 0.001
-CRITIC_LR = 0.0001
-ACTOR_L2_WEIGHT_DECAY = 0.01
+CRITIC_LR = 0.001
+ACTOR_L2_WEIGHT_DECAY = 0.00
 CRITIC_L2_WEIGHT_DECAY = 0.01
 BATCH_SIZE = 64
-ITERATIONS_BEFORE_TRAINING = BATCH_SIZE + 1 + TIME_DIM
-REPLAY_BUFFER_SIZE = 10000
+REPLAY_BUFFER_SIZE = 50000
 MAX_EPISODE_LENGTH = 1000
-BETA = .001
+ITERATIONS_BEFORE_TRAINING = BATCH_SIZE + 1 + TIME_DIM
+BETA = 0
 
 RBF_NUM_KERNELS = 1
 RBF_NUM_PARAMETERS = 1
@@ -38,6 +36,7 @@ THETA_PHI_PER_ACTION_DIM = RBF_NUM_KERNELS * RBF_NUM_PARAMETERS
 FLATTENED_THETA_PHI_DIM = THETA_PHI_PER_ACTION_DIM * ACTION_DIM
 
 # Inverting Gradients for Bounded Control - https://www.cs.utexas.edu/~AustinVilla/papers/ICLR16-hausknecht.pdf
+
 
 def fanin_init(layer):
     fanin = layer.get_shape().as_list()[1]
@@ -77,7 +76,7 @@ class ActorCell(tf.nn.rnn_cell.RNNCell):
         with tf.variable_scope(self.outer_scope + '/actor', reuse=self.reuse):
             uniform_random = tf.random_uniform_initializer(minval=-3e-3, maxval=3e-3)
             net = tf.concat(1, [inputs, last_theta_phi])
-            net = slim.fully_connected(net, 1024, weights_initializer=fanin_init(inputs),
+            net = slim.fully_connected(net, 1024, weights_initializer=fanin_init(net),
                                        biases_initializer=fanin_init(net))
             net = slim.fully_connected(net, 512, weights_initializer=fanin_init(net),
                                        biases_initializer=fanin_init(net))
@@ -92,8 +91,8 @@ def critic_network(state, theta_phi, last_theta_phi, outer_scope, reuse=False):
     with tf.variable_scope(outer_scope + '/critic', reuse=reuse):
         uniform_random = tf.random_uniform_initializer(minval=-3e-3, maxval=3e-3)
         net = tf.concat(1, [state, theta_phi, last_theta_phi])
-        net = slim.fully_connected(net, 1024, weights_initializer=fanin_init(state),
-                                   biases_initializer=fanin_init(state))
+        net = slim.fully_connected(net, 1024, weights_initializer=fanin_init(net),
+                                   biases_initializer=fanin_init(net))
         net = slim.fully_connected(net, 512, weights_initializer=fanin_init(net),
                                    biases_initializer=fanin_init(net))
         net = slim.fully_connected(net, 1, weights_initializer=uniform_random, biases_initializer=uniform_random,
@@ -134,8 +133,8 @@ done_placeholder = tf.placeholder(tf.bool, [None], 'done')
 
 train_actor_output, (_, train_actor_output_residual) = ActorCell(outer_scope='train_network')(state_placeholder, state=(last_theta_phi_placeholder, None))
 train_actor_next_output, (_, train_actor_next_output_residual) = ActorCell(outer_scope='train_network', reuse=True)(next_state_placeholder, state=(train_actor_output, None))
-target_actor_output, target_actor_output_residual = ActorCell(outer_scope='target_network')(state_placeholder, state=(last_theta_phi_placeholder, None))
-target_actor_next_output, target_actor_next_output_residual = ActorCell(outer_scope='target_network', reuse=True)(next_state_placeholder, state=(tf.stop_gradient(target_actor_output), None))
+target_actor_output, (_, target_actor_output_residual) = ActorCell(outer_scope='target_network')(state_placeholder, state=(last_theta_phi_placeholder, None))
+target_actor_next_output, (_, target_actor_next_output_residual) = ActorCell(outer_scope='target_network', reuse=True)(next_state_placeholder, state=(tf.stop_gradient(target_actor_output), None))
 
 # Policy Roll-out
 # train_actor_cell = ActorCell(outer_scope='train_network', reuse=True)
@@ -161,7 +160,7 @@ train_critic_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='t
 target_critic_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='target_network/critic')
 
 with tf.name_scope('actor_loss'):
-    weight_decay_actor = tf.add_n([ACTOR_L2_WEIGHT_DECAY * tf.nn.l2_loss(var) for var in train_actor_vars])
+    weight_decay_actor = tf.add_n([ACTOR_L2_WEIGHT_DECAY * tf.reduce_sum(var**2) for var in train_actor_vars])
 
     optim_actor = tf.train.AdamOptimizer(ACTOR_LR)
 
@@ -186,11 +185,11 @@ with tf.name_scope('actor_loss'):
         train_actor = tf.group(*[target.assign(TAU * train + (1 - TAU) * target) for train, target in train_target_vars])
 
 with tf.name_scope('critic_loss'):
-    combined_reward = reward_placeholder + BETA * tf.reduce_sum(tf.abs(train_actor_output_residual))
+    combined_reward = reward_placeholder  # - BETA * tf.stop_gradient(tf.reduce_sum(tf.abs(train_actor_output - last_theta_phi_placeholder), reduction_indices=[1]))
     q_target_value = tf.stop_gradient(tf.select(done_placeholder, combined_reward, combined_reward + GAMMA * target_critic_next_output))
     q_error = (q_target_value - train_critic_placeholder_action) ** 2
     q_error_batch = tf.reduce_mean(q_error)
-    weight_decay_critic = tf.add_n([CRITIC_L2_WEIGHT_DECAY * tf.nn.l2_loss(var) for var in train_critic_vars])
+    weight_decay_critic = tf.add_n([CRITIC_L2_WEIGHT_DECAY * tf.reduce_sum(var**2) for var in train_critic_vars])
     loss_critic = q_error_batch + weight_decay_critic
 
     # Critic Optimization
@@ -220,39 +219,36 @@ for episode in tqdm(xrange(1000)):
     last_theta_phi = np.zeros(FLATTENED_THETA_PHI_DIM)
     training = len(replay_buffer) - TIME_DIM - MAX_EPISODE_LENGTH >= min(ITERATIONS_BEFORE_TRAINING, replay_buffer.maxlen)
     testing = episode % 2 == 0 and training
-
+    total_reward = 0
     history = []
 
     for step in tqdm(xrange(MAX_EPISODE_LENGTH)):
         theta_phi = sess.run(train_actor_output, feed_dict={state_placeholder: [env_state],
                                                             last_theta_phi_placeholder: [last_theta_phi]})[0]
 
-        if not testing:
-            theta_phi += 0 if testing else eta_noise.ou(theta=.15, sigma=.2)
-        elif episode >= 10:
-            env.render()
+        theta_phi += 0 if testing else eta_noise.ou(theta=.15, sigma=.2)
+        env.render()
 
         action = sess.run(phi_from_theta_phi_placeholder, feed_dict={theta_phi_placeholder: [theta_phi]})
 
         assert action.shape == env.action_space.sample().shape, (action.shape, env.action_space.sample().shape)
 
         env_next_state, env_reward, env_done, env_info = env.step(np.clip(action, -1, 1) * 2)
+        total_reward += env_reward
 
         history.append((theta_phi, action, env_next_state))
+        replay_buffer.append([env_state, theta_phi, env_reward, env_next_state, env_done, last_theta_phi, np.sum(theta_phi - last_theta_phi)])
 
-        if not testing:
-            replay_buffer.append([env_state, theta_phi, env_reward, env_next_state, env_done, last_theta_phi, np.linalg.norm(theta_phi - last_theta_phi, ord=1)])
-
-            replay_priorities_sum -= replay_priorities[len(replay_buffer) - 1]
-            replay_priorities[len(replay_buffer) - 1] = 100.0
-            replay_priorities_sum += 100.0
+        replay_priorities_sum -= replay_priorities[len(replay_buffer) - 1]
+        replay_priorities[len(replay_buffer) - 1] = 300
+        replay_priorities_sum += replay_priorities[len(replay_buffer) - 1]
 
         env_state = env_next_state
         last_theta_phi = sess.run(phishift_from_theta_phi_placeholder, feed_dict={theta_phi_placeholder: [theta_phi]})[0]
 
         if training:
-            p_errors = replay_priorities[:len(replay_buffer) - TIME_DIM - step] / (replay_priorities_sum - replay_priorities[len(replay_buffer) - TIME_DIM - step:len(replay_buffer)].sum())
-            minibatch_indexes = np.random.choice(xrange(len(replay_buffer) - TIME_DIM - step), size=BATCH_SIZE, replace=False, p=p_errors)
+            p_errors = replay_priorities[:len(replay_buffer) - TIME_DIM] / (replay_priorities_sum - replay_priorities[len(replay_buffer) - TIME_DIM:len(replay_buffer)].sum())
+            minibatch_indexes = np.random.choice(xrange(len(replay_buffer) - TIME_DIM), size=BATCH_SIZE, replace=False, p=p_errors)
 
             state_batch = [replay_buffer[i][0] for i in minibatch_indexes]
             theta_phi_batch = [replay_buffer[i][1] for i in minibatch_indexes]
@@ -265,7 +261,7 @@ for episode in tqdm(xrange(1000)):
             temporally_extended_states_batch = [[replay_buffer[i + t][0] for t in range(TIME_DIM)] for i in minibatch_indexes]
             future_theta_phi = [replay_buffer[i + FUTURE_THETA_N][1] if len(replay_buffer) > i + FUTURE_THETA_N else replay_buffer[i][1] for i in minibatch_indexes]
 
-            _, _, errors = sess.run([train_actor, train_critic, q_error],
+            _, _, errors, r = sess.run([train_actor, train_critic, q_error, combined_reward],
                                             feed_dict={
                                                 state_placeholder: state_batch,
                                                 theta_phi_placeholder: theta_phi_batch,
@@ -286,31 +282,32 @@ for episode in tqdm(xrange(1000)):
         if env_done:
             break
 
-    if not testing:
-        reward_bonus_normalizer = sum(b[6] for b in [replay_buffer[i] for i in range(len(replay_buffer) - step, len(replay_buffer))])
-        for i in range(len(replay_buffer) - step, len(replay_buffer)):
-            replay_buffer[i][6] /= reward_bonus_normalizer
+    reward_bonus_normalizer = sum(np.abs(b[6]) for b in [replay_buffer[i] for i in range(len(replay_buffer) - step - 1, len(replay_buffer))])
+    for i in range(len(replay_buffer) - step - 1, len(replay_buffer)):
+        replay_buffer[i][6] /= reward_bonus_normalizer
 
-        print 'Normalizer: ', reward_bonus_normalizer
-        print 'Total Reward: ', sum(b[2] for b in [replay_buffer[i] for i in range(len(replay_buffer) - step, len(replay_buffer))])
+    print 'Is Testing:', testing
+    print 'Total Reward: ', total_reward
+    print 'Total Penalty: ', reward_bonus_normalizer
+    print '\n'
 
-    if episode >= 10 and testing:
-        plt.setp(plt.plot([x[1][0] for x in history], 'o'), 'color', 'black', 'linewidth', 3.0)
-        #plt.setp(plt.plot([x[2][0] - 4 for x in history]), 'color', 'red', 'linewidth', 3.0)
-        for i in range(0, len(history)):
-            # split_parameters = np.split(np.reshape(history[i][0], [-1, ACTION_DIM, RBF_NUM_PARAMETERS, THETA_PHI_PER_ACTION_DIM // RBF_NUM_PARAMETERS]), RBF_NUM_PARAMETERS, axis=2)
-            # weights, centers, sigmas = [a * b for a, b in zip(split_parameters, RBF_MULTIPLIERS)]
-
-            subdata = []
-            xs = np.linspace(i, i+10, 10)
-            for x in xs:
-                subdata.append(history[i][0][0])
-                #subdata.append(np.tanh(np.sum(weights * np.exp(-(np.abs(x - centers - i) ** 2) / (2 * sigmas ** 2)))))
-
-            plt.plot(xs, subdata, 'ro', markersize=4, fillstyle='full', markeredgecolor='red', markeredgewidth=0.0)
-
-
-        plt.show()
+    # if episode >= 10 and testing:
+    #     plt.setp(plt.plot([x[1][0] for x in history], 'o'), 'color', 'black', 'linewidth', 3.0)
+    #     #plt.setp(plt.plot([x[2][0] - 4 for x in history]), 'color', 'red', 'linewidth', 3.0)
+    #     for i in range(0, len(history)):
+    #         # split_parameters = np.split(np.reshape(history[i][0], [-1, ACTION_DIM, RBF_NUM_PARAMETERS, THETA_PHI_PER_ACTION_DIM // RBF_NUM_PARAMETERS]), RBF_NUM_PARAMETERS, axis=2)
+    #         # weights, centers, sigmas = [a * b for a, b in zip(split_parameters, RBF_MULTIPLIERS)]
+    #
+    #         subdata = []
+    #         xs = np.linspace(i, i+10, 10)
+    #         for x in xs:
+    #             subdata.append(history[i][0][0])
+    #             #subdata.append(np.tanh(np.sum(weights * np.exp(-(np.abs(x - centers - i) ** 2) / (2 * sigmas ** 2)))))
+    #
+    #         plt.plot(xs, subdata, 'ro', markersize=4, fillstyle='full', markeredgecolor='red', markeredgewidth=0.0)
+    #
+    #
+    #     plt.show()
 
     # h = np.hstack([weights, sigmas, centers])
     # a = h.T
