@@ -94,21 +94,43 @@ def passthrough_multiply(forward_op_a, forward_op_b):
     with forward_op_a.graph.gradient_override_map({"Mul": gradient_op_name}):
         return tf.mul(forward_op_a, forward_op_b)
 
+
 class Noise:
     def __init__(self, ):
-        global FLATTENED_THETA_PHI_DIM
         self.state = np.zeros(FLATTENED_THETA_PHI_DIM)
-        self.perlin_seed = np.random.randint(1, 20, size=FLATTENED_THETA_PHI_DIM)
+        self.noise = np.array([self.__normalize__(self.__colored_noise__(300, alpha=1)) for _ in range(FLATTENED_THETA_PHI_DIM)]).T
+        self.count = 0
+
+    def __ms__(self, x):
+        return (np.abs(x) ** 2.0).mean()
+
+    def __normalize__(self, signal):
+        signal -= signal.min()
+        signal /= signal.max()
+        return signal
+
+    def __colored_noise__(self, N, state=None, alpha=1):
+        state = np.random.RandomState() if state is None else state
+        uneven = N % 2
+        X = state.randn(N // 2 + 1 + uneven) + 1j * state.randn(N // 2 + 1 + uneven)
+        S = (np.arange(len(X)) + 1)**alpha
+        y = (np.fft.irfft(X / S)).real
+        if uneven:
+            y = y[:-1]
+        return y * np.sqrt(1.0 / self.__ms__(y))
+
+    def brown_ou(self, mean, beta=1, alpha=.3):
+        self.state += -beta*(self.state - mean) + alpha * self.noise[self.count]
+        self.count += 1
+        return self.state.copy()
 
     def josh(self, mu, sigma):
         return stats.truncnorm.rvs((-1 - mu) / sigma, (1 - mu) / sigma, loc=mu, scale=sigma, size=len(self.state))
 
-    def perlin(self, step):
-        return np.array([pnoise1(step * self.perlin_seed[i] / 256.0 - 0.5 * self.perlin_seed[i], 3) for i in range(FLATTENED_THETA_PHI_DIM)])
-
     def ou(self, theta, sigma):
         self.state += theta * self.state - sigma * np.random.randn(len(self.state))
-        return self.state
+        return self.state.copy()
+
 
 class ActorCell(tf.nn.rnn_cell.RNNCell):
     def __init__(self, outer_scope, reuse=False):
@@ -252,7 +274,7 @@ for episode in tqdm(xrange(1000)):
     for step in tqdm(xrange(MAX_EPISODE_LENGTH)):
         theta_phi = sess.run(train_actor_output, feed_dict={state_placeholder: [env_state], last_theta_phi_placeholder: [last_theta_phi]})[0]
 
-        theta_phi = theta_phi if testing else theta_phi + np.clip(abs(eta_noise.perlin(step=step)), 0, 1) * np.array([0, 1, 1, 0])
+        theta_phi = theta_phi if testing else np.clip(eta_noise.brown_ou(theta_phi), 0, 1)
 
         print theta_phi
 
@@ -320,13 +342,8 @@ for episode in tqdm(xrange(1000)):
     print 'Total Penalty: ', reward_bonus_normalizer
     print '\n'
 
-    # data = []
-    # tmp_phi = theta_phi
-    # for i in range(1000):
-    #     data.append(history[i][1])
-    #
-    # plt.plot(data)
-    # plt.show()
+    plt.plot([h[0] for h in history], 'r')
+    plt.show()
 
     # if episode >= 10 and testing:
     #     plt.setp(plt.plot([x[1][0] for x in history], 'o'), 'color', 'black', 'linewidth', 3.0)

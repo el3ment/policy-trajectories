@@ -1,3 +1,7 @@
+You will have to gradually change f(t) in order to avoid the abrupt changes. So, you measure f one time and it is (say) 1000Hz, then the next time it is 1100hz. You cannot simply change from one to the other. You will have to "walk" the value for f from 1000Hz to 1100Hz over the length of time it takes for one half cycle of 1100Hz.
+
+
+
 # Result from beta=3, spark=off
 # Episode 11
 # Is Testing: True
@@ -48,3 +52,5 @@ test
 #
 # def phishift(theta):
 #     return tf.identity(theta)
+
+ 
